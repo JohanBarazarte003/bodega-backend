@@ -55,7 +55,7 @@ app.post('/api/clientes', async (req, res) => {
     }
 });
 
-// NUEVA RUTA: Eliminar un cliente de la base de datos
+// Eliminar un cliente de la base de datos
 app.delete('/api/clientes/:id', async (req, res) => {
     try {
         const { id } = req.params;
@@ -117,7 +117,7 @@ app.put('/api/productos/:id', async (req, res) => {
     }
 });
 
-// NUEVA RUTA: Eliminar un producto del inventario
+// Eliminar un producto del inventario
 app.delete('/api/productos/:id', async (req, res) => {
     try {
         const { id } = req.params;
@@ -162,6 +162,25 @@ app.post('/api/fiar', async (req, res) => {
         res.json({ mensaje: "Consumo cargado", saldo: nuevaDeuda });
     } catch (err) { 
         res.status(500).json({ error: err.message }); 
+    }
+});
+
+// =========================================================================
+// 4.1 NUEVA RUTA: Obtener lo que debe un cliente específico
+// =========================================================================
+app.get('/api/consumos/:cliente_id', async (req, res) => {
+    try {
+        const { cliente_id } = req.params;
+        const { data, error } = await supabase
+            .from('consumos')
+            .select('*')
+            .eq('cliente_id', cliente_id)
+            .order('created_at', { ascending: false }); // Lo más nuevo arriba
+
+        if (error) throw error;
+        res.json(data || []);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
     }
 });
 
