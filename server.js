@@ -26,7 +26,6 @@ console.log(`✓ Cliente de Supabase configurado para: ${supabaseUrl}`);
 // 2. RUTAS DE CLIENTES
 // =========================================================================
 
-// Obtener TODOS los clientes registrados
 app.get('/api/clientes', async (req, res) => {
     try {
         const { data, error } = await supabase
@@ -40,7 +39,6 @@ app.get('/api/clientes', async (req, res) => {
     }
 });
 
-// Crear un nuevo cliente
 app.post('/api/clientes', async (req, res) => {
     try {
         const { nombre, telefono } = req.body;
@@ -55,7 +53,6 @@ app.post('/api/clientes', async (req, res) => {
     }
 });
 
-// Eliminar un cliente de la base de datos
 app.delete('/api/clientes/:id', async (req, res) => {
     try {
         const { id } = req.params;
@@ -98,7 +95,6 @@ app.post('/api/productos', async (req, res) => {
     }
 });
 
-// Editar precio de un producto existente
 app.put('/api/productos/:id', async (req, res) => {
     try {
         const { id } = req.params;
@@ -117,7 +113,6 @@ app.put('/api/productos/:id', async (req, res) => {
     }
 });
 
-// Eliminar un producto del inventario
 app.delete('/api/productos/:id', async (req, res) => {
     try {
         const { id } = req.params;
@@ -142,32 +137,45 @@ app.post('/api/fiar', async (req, res) => {
         const { cliente_id, producto_id, cantidad } = req.body;
         const cant = parseInt(cantidad) || 1;
 
-        const { data: cData } = await supabase.from('clientes').select('*').eq('id', cliente_id);
-        const { data: pData } = await supabase.from('productos').select('*').eq('id', producto_id);
+        // Consultas puntuales en paralelo para mejorar el performance
+        const [cRes, pRes] = await Promise.all([
+            supabase.from('clientes').select('*').eq('id', cliente_id),
+            supabase.from('productos').select('*').eq('id', producto_id)
+        ]);
 
-        if (!cData?.length || !pData?.length) return res.status(404).json({ error: "Registros no encontrados" });
+        if (!cRes.data?.length || !pRes.data?.length) {
+            return res.status(404).json({ error: "Registros no encontrados" });
+        }
 
-        const cliente = cData[0];
-        const producto = pData[0];
-        const subtotal = producto.precio_usd * cant;
-        const nuevaDeuda = parseFloat(cliente.deuda_usd || 0) + subtotal;
+        const cliente = cRes.data[0];
+        const producto = pRes.data[0];
+        const subtotal = parseFloat((producto.precio_usd * cant).toFixed(2));
+        const nuevaDeuda = parseFloat((parseFloat(cliente.deuda_usd || 0) + subtotal).toFixed(2));
 
-        await supabase.from('consumos').insert([{
-            cliente_id: cliente.id, cliente_nombre: cliente.nombre,
-            producto: producto.nombre, cantidad: cant,
-            precio_unitario_usd: producto.precio_usd, subtotal_usd: subtotal
+        // Inserción del consumo individual
+        const { error: insError } = await supabase.from('consumos').insert([{
+            cliente_id: cliente.id, 
+            cliente_nombre: cliente.nombre,
+            producto: producto.nombre, 
+            cantidad: cant,
+            precio_unitario_usd: producto.precio_usd, 
+            subtotal_usd: subtotal
         }]);
+        if (insError) throw insError;
 
-        await supabase.from('clientes').update({ deuda_usd: nuevaDeuda }).eq('id', cliente.id);
-        res.json({ mensaje: "Consumo cargado", saldo: nuevaDeuda });
+        // Actualización del consolidado en el cliente
+        const { error: updError } = await supabase
+            .from('clientes')
+            .update({ deuda_usd: nuevaDeuda })
+            .eq('id', cliente.id);
+        if (updError) throw updError;
+
+        res.json({ mensaje: "Consumo cargado con éxito", saldo: nuevaDeuda });
     } catch (err) { 
         res.status(500).json({ error: err.message }); 
     }
 });
 
-// =========================================================================
-// 4.1 NUEVA RUTA: Obtener lo que debe un cliente específico
-// =========================================================================
 app.get('/api/consumos/:cliente_id', async (req, res) => {
     try {
         const { cliente_id } = req.params;
@@ -175,7 +183,7 @@ app.get('/api/consumos/:cliente_id', async (req, res) => {
             .from('consumos')
             .select('*')
             .eq('cliente_id', cliente_id)
-            .order('created_at', { ascending: false }); // Lo más nuevo arriba
+            .order('created_at', { ascending: false });
 
         if (error) throw error;
         res.json(data || []);
@@ -184,6 +192,7 @@ app.get('/api/consumos/:cliente_id', async (req, res) => {
     }
 });
 
+// ABONO PARCIAL O COMPLETO MANUAL
 app.post('/api/pagos', async (req, res) => {
     try {
         const { cliente_id, monto, moneda, tasa } = req.body;
@@ -201,15 +210,16 @@ app.post('/api/pagos', async (req, res) => {
 
         if (moneda === 'BS') {
             abonoBs = montoInput;
-            abonoUsd = montoInput / tasaDia; 
+            abonoUsd = parseFloat((montoInput / tasaDia).toFixed(2)); 
         } else {
             abonoUsd = montoInput;
-            abonoBs = montoInput * tasaDia;  
+            abonoBs = parseFloat((montoInput * tasaDia).toFixed(2));  
         }
         
-        let nuevaDeuda = deudaActual - abonoUsd;
-        if (nuevaDeuda < 0.01) nuevaDeuda = 0; 
+        let nuevaDeuda = parseFloat((deudaActual - abonoUsd).toFixed(2));
+        if (nuevaDeuda <= 0.01) nuevaDeuda = 0; 
 
+        // 1. Registrar auditoría del pago
         await supabase.from('pagos').insert([{
             cliente_id: cliente.id,
             monto_usd: abonoUsd,
@@ -218,11 +228,56 @@ app.post('/api/pagos', async (req, res) => {
             notes: `Abono registrado en ${moneda}`
         }]);
 
+        // 2. Si la cuenta quedó en 0, limpiamos los consumos activos de este ciclo
+        if (nuevaDeuda === 0) {
+            await supabase.from('consumos').delete().eq('cliente_id', cliente.id);
+        }
+
+        // 3. Modificamos la ficha consolidada del cliente
         await supabase.from('clientes').update({ deuda_usd: nuevaDeuda }).eq('id', cliente.id);
 
         res.json({ mensaje: "Pago registrado con éxito", nuevo_saldo_usd: nuevaDeuda });
     } catch (err) { 
         res.status(500).json({ error: err.message }); 
+    }
+});
+
+// NUEVA RUTA: SALDAR DEUDA POR COMPLETO (BOTÓN DE BORRADO DE EXPEDIENTE)
+app.post('/api/saldar-todo', async (req, res) => {
+    try {
+        const { cliente_id, tasa } = req.body;
+        const tasaDia = parseFloat(tasa);
+
+        const { data: cData } = await supabase.from('clientes').select('*').eq('id', cliente_id);
+        if (!cData?.length) return res.status(404).json({ error: "Cliente no encontrado" });
+
+        const cliente = cData[0];
+        const deudaCierre = parseFloat(cliente.deuda_usd || 0);
+
+        if (deudaCierre === 0) {
+            return res.json({ mensaje: "El cliente ya no tiene deudas pendientes", nuevo_saldo_usd: 0 });
+        }
+
+        const montoBsEquivalente = parseFloat((deudaCierre * tasaDia).toFixed(2));
+
+        // 1. Guardamos registro en la tabla de pagos indicando el cierre forzado del ciclo
+        await supabase.from('pagos').insert([{
+            cliente_id: cliente.id,
+            monto_usd: deudaCierre,
+            monto_bs: montoBsEquivalente,
+            tasa_usada: tasaDia,
+            notes: "Saldado completo - Cierre automático de ciclo de deudas"
+        }]);
+
+        // 2. Vaciamos la tabla de consumos para que el mensaje de WhatsApp no acumule registros antiguos
+        await supabase.from('consumos').delete().eq('cliente_id', cliente.id);
+
+        // 3. Ponemos la cuenta del cliente exactamente en 0
+        await supabase.from('clientes').update({ deuda_usd: 0.00 }).eq('id', cliente.id);
+
+        res.json({ mensaje: "Ciclo cerrado. Cliente solvente.", nuevo_saldo_usd: 0 });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
     }
 });
 
@@ -232,15 +287,16 @@ app.post('/api/pagos', async (req, res) => {
 app.get('/api/tasa', async (req, res) => {
     try {
         const { data } = await axios.get('https://www.bcv.org.ve/', {
-            headers: { 'User-Agent': 'Mozilla/5.0' },
+            headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' },
             httpsAgent: new https.Agent({ rejectUnauthorized: false }),
-            timeout: 3000
+            timeout: 4000
         });
         const $ = cheerio.load(data);
         const tasaTexto = $('#dolar strong').text().trim();
-        const tasaLimpia = parseFloat(tasaTexto.replace('.', '').replace(',', '.'));
+        const tasaLimpia = parseFloat(tasaTexto.replace(/\./g, '').replace(',', '.'));
         res.json({ tasa: tasaLimpia, fuente: "BCV Oficial" });
     } catch (e) {
+        // Fallback estable si la página del gobierno experimenta latencia o caídas
         res.json({ tasa: 45.65, fuente: "BCV (Respaldo Fuera de Línea)" });
     }
 });
